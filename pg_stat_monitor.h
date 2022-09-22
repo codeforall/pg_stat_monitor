@@ -200,15 +200,30 @@ typedef struct PlanInfo
 	size_t		plan_len;		/* strlen(plan_text) */
 }			PlanInfo;
 
+typedef struct OriginInfo
+{
+	uint64		originid;		/* Key */
+	char 		app_name[APPLICATIONNAME_LEN]; /* Do not change the position */
+
+	Oid			userid;			/* user OID */
+	Oid			dbid;			/* database OID */
+	uint64		client_addr;	/* client ip address */
+	uint64		appid;
+}			OriginInfo;
+
+typedef struct BucketInfo
+{
+	uint64		bucket_id;		/* bucket number */
+	struct tm	start_time;
+	int			flags;
+}			SourceInfo;
+
 typedef struct pgssHashKey
 {
 	uint64		bucket_id;		/* bucket number */
 	uint64		queryid;		/* query identifier */
-	uint64		userid;			/* user OID */
-	uint64		dbid;			/* database OID */
-	uint64		ip;				/* client ip address */
+	uint64		origin_id;		/* plan identifier */
 	uint64		planid;			/* plan identifier */
-	uint64		appid;			/* hash of application name */
 	uint64		toplevel;		/* query executed at top level */
 } pgssHashKey;
 
@@ -217,7 +232,6 @@ typedef struct QueryInfo
 	uint64		parentid;		/* parent queryid of current query */
 	int64		type;			/* type of query, options are query, info,
 								 * warning, error, fatal */
-	char		application_name[APPLICATIONNAME_LEN];
 	char		comments[COMMENTS_LEN];
 	char		relations[REL_LST][REL_LEN];	/* List of relation involved
 												 * in the query */
@@ -310,6 +324,7 @@ typedef struct pgssEntry
 typedef struct pgssSharedState
 {
 	LWLock	   *lock;			/* protects hashtable search/modification */
+	LWLock	   *origines_lock;	/* protects hashtable search/modification */
 	double		cur_median_usage;	/* current median usage in hashtable */
 	slock_t		mutex;			/* protects following fields only: */
 	Size		extent;			/* current extent of query file */
@@ -406,6 +421,7 @@ int			pgsm_get_bucket_size(void);
 pgssSharedState *pgsm_get_ss(void);
 HTAB	   *pgsm_get_plan_hash(void);
 HTAB	   *pgsm_get_hash(void);
+HTAB	   *pgsm_get_origines_hash(void);
 HTAB	   *pgsm_get_query_hash(void);
 HTAB	   *pgsm_get_plan_hash(void);
 void		hash_entry_reset(void);

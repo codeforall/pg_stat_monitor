@@ -60,6 +60,9 @@ void		_PG_fini(void);
 
 /* Current nesting depth of ExecutorRun+ProcessUtility calls */
 static int	exec_nested_level = 0;
+OriginInfo origin_info;
+
+
 #if PG_VERSION_NUM >= 130000
 static int	plan_nested_level = 0;
 #endif
@@ -88,7 +91,7 @@ static bool IsSystemInitialized(void);
 static bool dump_queries_buffer(int bucket_id, unsigned char *buf, int buf_len);
 static double time_diff(struct timeval end, struct timeval start);
 static void request_additional_shared_resources(void);
-
+static void update_current_origin(void);
 
 /* Saved hook values in case of unload */
 
@@ -255,7 +258,7 @@ _PG_init(void)
 
 	snprintf(file_name, 1024, "%s", PGSM_TEXT_FILE);
 	unlink(file_name);
-
+	memset(&origin_info,0x00,sizeof(OriginInfo));
 	EmitWarningsOnPlaceholders("pg_stat_monitor");
 
 	/*
@@ -341,7 +344,6 @@ pgss_shmem_startup(void)
 
 	pgss_startup();
 }
-
 static void
 request_additional_shared_resources(void)
 {
@@ -351,7 +353,7 @@ request_additional_shared_resources(void)
 	 * resources in pgss_shmem_startup().
 	 */
 	RequestAddinShmemSpace(hash_memsize() + HOOK_STATS_SIZE);
-	RequestNamedLWLockTranche("pg_stat_monitor", 1);
+	RequestNamedLWLockTranche("pg_stat_monitor", 2);
 }
 /*
  * Select the version of pg_stat_monitor.
@@ -405,6 +407,8 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 	if (!pgsm_enabled(exec_nested_level))
 		return;
 
+	 if (!exec_nested_level)
+		update_current_origin();
 	/*
 	 * Clear queryId for prepared statements related utility, as those will
 	 * inherit from the underlying statement's one (except DEALLOCATE which is
@@ -470,6 +474,9 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query)
 		return;
 	if (!pgsm_enabled(exec_nested_level))
 		return;
+
+	 if (!exec_nested_level)
+		update_current_origin();
 
 	/*
 	 * Utility statements get queryId zero.  We do this even in cases where
@@ -1312,9 +1319,7 @@ pgss_update_entry(pgssEntry *entry,
 				  BufferUsage *bufusage,
 				  WalUsage *walusage,
 				  bool reset,
-				  pgssStoreKind kind,
-				  const char *app_name,
-				  size_t app_name_len)
+				  pgssStoreKind kind)
 {
 	int			index;
 	double		old_mean;
@@ -1392,9 +1397,6 @@ pgss_update_entry(pgssEntry *entry,
 
 		if (plan_text_len > 0 && !e->counters.planinfo.plan_text[0])
 			_snprintf(e->counters.planinfo.plan_text, plan_info->plan_text, plan_text_len + 1, PLAN_TEXT_LEN);
-
-		if (app_name_len > 0 && !e->counters.info.application_name[0])
-			_snprintf(e->counters.info.application_name, app_name, app_name_len + 1, APPLICATIONNAME_LEN);
 
 		e->counters.info.num_relations = num_relations;
 		_snprintf2(e->counters.info.relations, relations, num_relations, REL_LEN);
@@ -1506,20 +1508,12 @@ pgss_store(uint64 queryid,
 	pgssHashKey key;
 	pgssEntry  *entry;
 	pgssSharedState *pgss = pgsm_get_ss();
-	char	   *app_name_ptr;
-	char		app_name[APPLICATIONNAME_LEN] = "";
-	int			app_name_len = 0;
 	bool		reset = false;
 	uint64		bucketid;
 	uint64		prev_bucket_id;
-	uint64		userid;
 	uint64		planid;
-	uint64		appid = 0;
 	char		comments[512] = "";
 	char	   *norm_query = NULL;
-	bool		found_app_name = false;
-	bool		found_client_addr = false;
-	uint		client_addr = 0;
 
 	/* Safety check... */
 	if (!IsSystemInitialized())
@@ -1557,31 +1551,6 @@ pgss_store(uint64 queryid,
 #endif
 
 	Assert(query != NULL);
-	if (kind == PGSS_ERROR)
-	{
-		int			sec_ctx;
-
-		GetUserIdAndSecContext((Oid *) &userid, &sec_ctx);
-	}
-	else
-		userid = GetUserId();
-
-	/* Try to read application name from GUC directly */
-	if (application_name && *application_name)
-	{
-		app_name_ptr = application_name;
-		appid = djb2_hash_str((unsigned char *) application_name, &app_name_len);
-	}
-	else
-	{
-		app_name_len = pg_get_application_name(app_name, &found_app_name);
-		if (found_app_name)
-			appid = djb2_hash((unsigned char *) app_name, app_name_len);
-		app_name_ptr = app_name;
-	}
-
-	if (!found_client_addr)
-		client_addr = pg_get_client_addr(&found_client_addr);
 
 	planid = plan_info ? plan_info->planid : 0;
 
@@ -1596,12 +1565,9 @@ pgss_store(uint64 queryid,
 		reset = true;
 
 	key.bucket_id = bucketid;
-	key.userid = userid;
-	key.dbid = MyDatabaseId;
+	key.origin_id = origin_info.originid;
 	key.queryid = queryid;
-	key.ip = client_addr;
 	key.planid = planid;
-	key.appid = appid;
 #if PG_VERSION_NUM < 140000
 	key.toplevel = 1;
 #else
@@ -1714,9 +1680,7 @@ pgss_store(uint64 queryid,
 						  bufusage, /* bufusage */
 						  walusage, /* walusage */
 						  reset,	/* reset */
-						  kind, /* kind */
-						  app_name_ptr,
-						  app_name_len);
+						  kind /* kind */);
 
 	LWLockRelease(pgss->lock);
 	if (norm_query)
@@ -1797,7 +1761,13 @@ pg_stat_monitor_internal(FunctionCallInfo fcinfo,
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
 	HASH_SEQ_STATUS hash_seq;
+	uint64	last_origin_id = 0;
 	pgssEntry  *entry;
+	OriginInfo	*origin_entry = NULL;
+	uint64          dbid;
+	uint64          userid;
+	uint64          ip;
+	char*			app_name = NULL;
 	char		parentid_txt[32];
 	pgssSharedState *pgss = pgsm_get_ss();
 	HTAB	   *pgss_hash = pgsm_get_hash();
@@ -1853,9 +1823,7 @@ pg_stat_monitor_internal(FunctionCallInfo fcinfo,
 		char		planid_text[32] = {0};
 		uint64		queryid = entry->key.queryid;
 		uint64		bucketid = entry->key.bucket_id;
-		uint64		dbid = entry->key.dbid;
-		uint64		userid = entry->key.userid;
-		uint64		ip = entry->key.ip;
+		uint64		origin_id = entry->key.origin_id;
 		uint64		planid = entry->key.planid;
 #if PG_VERSION_NUM < 140000
 		bool		toplevel = 1;
@@ -1864,6 +1832,29 @@ pg_stat_monitor_internal(FunctionCallInfo fcinfo,
 		bool		is_allowed_role = is_member_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS);
 		bool		toplevel = entry->key.toplevel;
 #endif
+
+		if (last_origin_id != origin_id)
+		{
+			HTAB	*pgss_origines_hash = pgsm_get_origines_hash();
+			LWLockAcquire(pgss->origines_lock, LW_SHARED);
+			origin_entry = (OriginInfo *) hash_search(pgss_origines_hash, &origin_id, HASH_FIND, NULL);
+			LWLockRelease(pgss->origines_lock);
+			if (origin_entry)
+			{
+				dbid = origin_entry->dbid;
+				userid = origin_entry->userid;
+				ip = origin_entry->client_addr;
+				app_name = origin_entry->app_name;
+			}
+			else
+			{
+				dbid = InvalidOid;
+				userid = InvalidOid;
+				app_name = NULL;
+				ip = 0;
+			}
+			last_origin_id = origin_id;
+		}
 
 		if (read_query(pgss_qbuf, queryid, query_txt, entry->query_pos) == 0)
 		{
@@ -1992,8 +1983,8 @@ pg_stat_monitor_internal(FunctionCallInfo fcinfo,
 		}
 
 		/* application_name at column number 9 */
-		if (strlen(tmp.info.application_name) > 0)
-			values[i++] = CStringGetTextDatum(tmp.info.application_name);
+		if (app_name)
+			values[i++] = CStringGetTextDatum(app_name);
 		else
 			nulls[i++] = true;
 
@@ -4015,3 +4006,63 @@ update_hook_stats(enum pg_hook_stats_id hook_id, double time_elapsed)
 	p->ncalls++;
 }
 #endif
+
+static void
+update_current_origin(void)
+{
+	bool found = false;
+	int	app_name_len;
+	uint64 appid = origin_info.appid;
+	Oid userid = GetUserId();
+	uint64 client_addr = pg_get_client_addr(&found);
+	pgssSharedState *pgss = pgsm_get_ss();
+
+	/* Try to read application name from GUC directly */
+	if (application_name && *application_name)
+	{
+		if (strncmp(origin_info.app_name, application_name, sizeof(origin_info.app_name)) )
+		{
+			strlcpy(origin_info.app_name, application_name, sizeof(origin_info.app_name));
+			appid = djb2_hash_str((unsigned char *)origin_info.app_name, &app_name_len);
+		}
+	}
+	else
+	{
+		found = false;
+		app_name_len = pg_get_application_name(origin_info.app_name, &found);
+		appid = djb2_hash((unsigned char *)origin_info.app_name, app_name_len);
+	}
+
+	if (origin_info.appid != appid ||
+		origin_info.userid != userid)
+	{
+		HTAB	   *pgss_origines_hash;
+		OriginInfo	*entry;
+		found = false;
+
+		pgss_origines_hash = pgsm_get_origines_hash();
+
+		origin_info.appid = appid;
+		origin_info.userid = userid;
+		origin_info.dbid = MyDatabaseId;
+		origin_info.client_addr = client_addr;
+
+		origin_info.originid = djb2_hash((unsigned char *) &origin_info.userid, sizeof(OriginInfo) - sizeof(uint64) - sizeof(origin_info.app_name));
+
+		LWLockAcquire(pgss->origines_lock, LW_SHARED);
+		entry = (OriginInfo *) hash_search(pgss_origines_hash, &origin_info.originid, HASH_FIND, NULL);
+		if (!entry)
+		{
+			LWLockRelease(pgss->origines_lock);
+			LWLockAcquire(pgss->origines_lock, LW_EXCLUSIVE);
+
+			/* Locate the entry in origines hash table */
+			entry = (OriginInfo *) hash_search(pgss_origines_hash, &origin_info.originid, HASH_ENTER_NULL, &found);
+			if (entry == NULL)
+				elog(DEBUG1, "update_current_origin: OUT OF MEMORY");
+			else if (!found)
+				memcpy(entry, &origin_info, sizeof(OriginInfo));
+		}
+		LWLockRelease(pgss->origines_lock);
+	}
+}

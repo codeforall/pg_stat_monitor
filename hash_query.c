@@ -19,10 +19,15 @@
 
 #include "pg_stat_monitor.h"
 
+#define MAX_ORIGIN_ENTRIES	200 /* TODO: Just an arbitrary value for now.
+								 * may be setting it to max_connections
+								 * makes more sense
+								 * */
 
 static pgssSharedState *pgss;
 static HTAB *pgss_hash;
 static HTAB *pgss_query_hash;
+static HTAB *pgss_origines_hash;
 
 
 static HTAB *
@@ -45,6 +50,7 @@ pgss_startup(void)
 
 	pgss = NULL;
 	pgss_hash = NULL;
+	LWLockPadded* locks;
 
 	/*
 	 * Create or attach to the shared memory state, including hash table
@@ -55,7 +61,10 @@ pgss_startup(void)
 	if (!found)
 	{
 		/* First time through ... */
-		pgss->lock = &(GetNamedLWLockTranche("pg_stat_monitor"))->lock;
+		locks = GetNamedLWLockTranche("pg_stat_monitor");
+		pgss->lock = &locks[0].lock;
+		pgss->origines_lock = &locks[1].lock;
+
 		SpinLockInit(&pgss->mutex);
 		ResetSharedState(pgss);
 	}
@@ -68,7 +77,7 @@ pgss_startup(void)
 
 	pgss_hash = hash_init("pg_stat_monitor: bucket hashtable", sizeof(pgssHashKey), sizeof(pgssEntry), MAX_BUCKET_ENTRIES);
 	pgss_query_hash = hash_init("pg_stat_monitor: queryID hashtable", sizeof(uint64), sizeof(pgssQueryEntry), MAX_BUCKET_ENTRIES);
-
+	pgss_origines_hash = hash_init("pg_stat_monitor: origines hashtable", sizeof(uint64), sizeof(OriginInfo), MAX_ORIGIN_ENTRIES);
 	LWLockRelease(AddinShmemInitLock);
 
 	/*
@@ -88,6 +97,12 @@ HTAB *
 pgsm_get_hash(void)
 {
 	return pgss_hash;
+}
+
+HTAB *
+pgsm_get_origines_hash(void)
+{
+	return pgss_origines_hash;
 }
 
 HTAB *
@@ -308,6 +323,7 @@ hash_entry_reset()
 	pgssSharedState *pgss = pgsm_get_ss();
 	HASH_SEQ_STATUS hash_seq;
 	pgssEntry  *entry;
+	OriginInfo	*origin_entry;
 
 	LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
 
@@ -318,11 +334,20 @@ hash_entry_reset()
 	}
 	pg_atomic_write_u64(&pgss->current_wbucket, 0);
 	LWLockRelease(pgss->lock);
+
+	LWLockAcquire(pgss->origines_lock, LW_EXCLUSIVE);
+	hash_seq_init(&hash_seq, pgss_origines_hash);
+	while ((origin_entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		hash_search(pgss_origines_hash, &origin_entry->originid, HASH_REMOVE, NULL);
+	}
+	LWLockRelease(pgss->origines_lock);
 }
 
 bool
 IsHashInitialize(void)
 {
 	return (pgss != NULL &&
-			pgss_hash != NULL);
+			pgss_hash != NULL
+			&& pgss_origines_hash != NULL);
 }

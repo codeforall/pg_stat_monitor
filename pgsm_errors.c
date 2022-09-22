@@ -40,7 +40,9 @@ PG_FUNCTION_INFO_V1(pg_stat_monitor_reset_errors);
  * the different type of errors that pg_stat_monitor may
  * report, e.g. out of memory.
  */
-#define PSGM_ERRORS_MAX 128
+#define PSGM_ERRORS_MAX 128	/* TODO: Just an arbitrary for now. 
+							 * may be setting it equal to max_connections makes more sense
+							 */
 
 static HTAB *pgsm_errors_ht = NULL;
 
